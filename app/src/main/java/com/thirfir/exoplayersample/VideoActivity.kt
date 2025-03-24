@@ -171,17 +171,20 @@ class VideoActivity : AppCompatActivity() {
 
     private fun convertVideoToImages() {
         val outputDir = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "${videoUrl.hashCode()}")
-        if (outputDir.exists()) {
+        if (outputDir.exists() && outputDir.listFiles()?.isNotEmpty() == true) {
+            println("Converting video to images1...")
             binding.recyclerViewTimeline.adapter = TimelineAdapter(outputDir.listFiles()?.map { it.absolutePath }?.sorted()?.also {
                 timelineTotalWidth = 68f.toPx(this) * it.size
             } ?: emptyList())
         } else {
+            println("Converting video to images2...")
             outputDir.mkdirs()
             val outputPattern = File(outputDir, "%%04d.jpg").absolutePath
 
             val ffmpegCommand = String.format("-i %s -vf fps=1/1 $outputPattern", videoUrl)
             FFmpegKit.executeAsync(ffmpegCommand) { session: FFmpegSession ->
                 if (ReturnCode.isSuccess(session.returnCode)) {
+                    log("Conversion succeeded.")
                     val imagePaths =
                         outputDir.listFiles()?.map { it.absolutePath }?.sorted() ?: emptyList()
                     CoroutineScope(Dispatchers.Main).launch {
@@ -289,7 +292,6 @@ class VideoActivity : AppCompatActivity() {
     }
 
     private fun getSubtitleFile(timeMs: Long): File {
-        log("dddddddd $timeMs")
         val outputDir = File(getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), "${videoUrl.hashCode()}")
         if (!outputDir.exists()) {
             outputDir.mkdirs()
