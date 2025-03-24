@@ -3,19 +3,17 @@ package com.thirfir.exoplayersample
 import android.content.res.Resources
 import android.graphics.Rect
 import android.media.MediaMetadataRetriever
-import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
-import android.provider.MediaStore
 import android.view.View
-import android.view.WindowInsetsController
-import android.view.WindowInsetsController.*
+import android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+import android.view.WindowInsetsController.APPEARANCE_TRANSPARENT_CAPTION_BAR_BACKGROUND
 import androidx.activity.enableEdgeToEdge
+import androidx.annotation.MainThread
 import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -33,7 +31,6 @@ import com.google.api.gax.core.FixedCredentialsProvider
 import com.google.auth.oauth2.GoogleCredentials
 import com.google.cloud.speech.v1.RecognitionAudio
 import com.google.cloud.speech.v1.RecognitionConfig
-import com.google.cloud.speech.v1.RecognizeResponse
 import com.google.cloud.speech.v1.SpeechClient
 import com.google.cloud.speech.v1.SpeechSettings
 import com.google.protobuf.ByteString
@@ -43,6 +40,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -58,6 +56,10 @@ class VideoActivity : AppCompatActivity() {
         ExoPlayer.Builder(this).build()
     }
 
+    private val videoUrl by lazy(LazyThreadSafetyMode.NONE) {
+        intent.data?.getRealPath(this)
+    }
+
     private val retriever by lazy(LazyThreadSafetyMode.NONE) {
         MediaMetadataRetriever().apply { setDataSource(this@VideoActivity, intent.data!!) }
     }
@@ -66,9 +68,29 @@ class VideoActivity : AppCompatActivity() {
         createSpeechSettings()
     }
 
-    private val subtitleQueue = mutableListOf<String>()
-    private var currentSubtitleTimeMs = 0L
+    private val speechClient by lazy(LazyThreadSafetyMode.NONE) {
+        SpeechClient.create(speechSettings)
+    }
+
+    private val recognitionConfig by lazy(LazyThreadSafetyMode.NONE) {
+        RecognitionConfig.newBuilder()
+            .setEncoding(RecognitionConfig.AudioEncoding.LINEAR16)
+            .setLanguageCode(SUBTITLE_LANGUAGE_CODE)
+            .setAudioChannelCount(2)
+            .build()
+    }
+
     private var subtitleJob: Job? = null
+    private val displayedSubtitleQueue = ArrayDeque<Pair<Int, String>>() // (time, subtitle)
+    private var currentSubtitleTimeMs = 0L
+    private var timelineScrollJob: Job? = null
+
+    private var timelineTotalWidth = 0f
+    val halfWidth by lazy {
+        Resources.getSystem().displayMetrics.widthPixels / 2
+    }
+
+    private val subtitleLoadJobs = mutableListOf<Job>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -85,17 +107,28 @@ class VideoActivity : AppCompatActivity() {
 
         initializePlayer()
         initializeFrames()
+        binding.fab.setOnClickListener {
+            val wasPlaying = player.isPlaying
+            player.pause()
+            SubtitleEditDialog(
+                videoUrl!!,
+                player.duration,
+                SUBTITLE_SEGMENT_DURATION_MS,
+                onDismiss = {
+                    if (wasPlaying) {
+                        player.play()
+                    }
+                }
+            ).show(supportFragmentManager, "subtitle_edit_dialog")
+        }
     }
 
-    override fun onStart() {
-        super.onStart()
-        player.play()
-    }
 
     private fun initializeFrames() {
         binding.recyclerViewTimeline.layoutManager =
             LinearLayoutManager(this, LinearLayoutManager.HORIZONTAL, false)
-        convertVideoToImages(intent.data?.getRealPathFromUri())
+        convertVideoToImages()
+
         binding.recyclerViewTimeline.addItemDecoration(object: ItemDecoration() {
             override fun getItemOffsets(
                 outRect: Rect,
@@ -104,7 +137,6 @@ class VideoActivity : AppCompatActivity() {
                 state: RecyclerView.State
             ) {
                 super.getItemOffsets(outRect, view, parent, state)
-                val halfWidth = Resources.getSystem().displayMetrics.widthPixels / 2
                 if (parent.getChildAdapterPosition(view) == 0) {
                     outRect.left = halfWidth
                 } else if (parent.getChildAdapterPosition(view) == state.itemCount - 1) {
@@ -112,31 +144,42 @@ class VideoActivity : AppCompatActivity() {
                 }
             }
         })
-    }
-
-    private fun Uri.getRealPathFromUri(): String? {
-        var filePath: String? = null
-        val cursor = contentResolver.query(this, arrayOf(MediaStore.Video.Media.DATA), null, null, null)
-        cursor?.use {
-            if (it.moveToFirst()) {
-                val columnIndex = it.getColumnIndex(MediaStore.Video.Media.DATA)
-                if (columnIndex != -1) {
-                    filePath = it.getString(columnIndex)
+        binding.recyclerViewTimeline.addOnScrollListener(object: RecyclerView.OnScrollListener() {
+            private var xPos = halfWidth
+            private var wasPlaying = false
+            override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                if (newState == RecyclerView.SCROLL_STATE_IDLE) {
+                    if (timelineTotalWidth > 0) {
+                        val t = xPos - halfWidth
+                        val b = timelineTotalWidth
+                        val per = t / b
+                        player.seekTo((player.duration * per).toLong())
+                        if (wasPlaying) {
+                            player.play()
+                        }
+                    }
+                } else if (newState == RecyclerView.SCROLL_STATE_DRAGGING) {
+                    wasPlaying = player.isPlaying
+                    player.pause()
                 }
             }
-        }
-        return filePath
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                xPos += dx
+            }
+        })
     }
 
-    private fun convertVideoToImages(videoUrl: String?) {
+    private fun convertVideoToImages() {
         val outputDir = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "${videoUrl.hashCode()}")
         if (outputDir.exists()) {
-            binding.recyclerViewTimeline.adapter = TimelineAdapter(outputDir.listFiles()?.map { it.absolutePath }?.sorted() ?: emptyList())
+            binding.recyclerViewTimeline.adapter = TimelineAdapter(outputDir.listFiles()?.map { it.absolutePath }?.sorted()?.also {
+                timelineTotalWidth = 68f.toPx(this) * it.size
+            } ?: emptyList())
         } else {
             outputDir.mkdirs()
             val outputPattern = File(outputDir, "%%04d.jpg").absolutePath
 
-            val ffmpegCommand = String.format("-i %s -vf fps=1/1 ${outputPattern}", videoUrl)
+            val ffmpegCommand = String.format("-i %s -vf fps=1/1 $outputPattern", videoUrl)
             FFmpegKit.executeAsync(ffmpegCommand) { session: FFmpegSession ->
                 if (ReturnCode.isSuccess(session.returnCode)) {
                     val imagePaths =
@@ -147,11 +190,12 @@ class VideoActivity : AppCompatActivity() {
                 } else if (ReturnCode.isCancel(session.returnCode)) {
                     // Canceled
                 } else {
-                    println("Conversion failed. ${session.failStackTrace} ${session.returnCode}")
+                    log("Conversion failed. ${session.failStackTrace} ${session.returnCode}")
                 }
             }
         }
     }
+
     private fun initializePlayer() {
         binding.playerView.player = player
 
@@ -163,9 +207,18 @@ class VideoActivity : AppCompatActivity() {
         player.setMediaItem(mediaItem)
         player.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
+                // 한 번만 호출됨
+                if (playbackState == Player.STATE_READY && subtitleLoadJobs.isEmpty()) {
+                    lifecycleScope.launch {
+                        val loadingDialog = LoadingDialog(this@VideoActivity)
+                        loadingDialog.show()
+                        loadAllSubtitles()
+                        loadingDialog.dismiss()
+                    }
+                }
                 if (playbackState == Player.STATE_ENDED) {
                     lifecycleScope.launch {
-                        subtitleQueue.clear()
+                        displayedSubtitleQueue.clear()
                         delay(3000)
                         binding.playerView.subtitleView?.setCues(null)
                     }
@@ -173,10 +226,14 @@ class VideoActivity : AppCompatActivity() {
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (!isPlaying)
+                if (!isPlaying) {
                     subtitleJob?.cancel()
+                    timelineScrollJob?.cancel()
+                }
                 else {
-                    showNextSubtitle()
+                    createAndStartTimelineScrollJob()
+                    if (subtitleLoadJobs.isNotEmpty())
+                        createAndStartSubtitleJob()
                 }
             }
 
@@ -185,12 +242,108 @@ class VideoActivity : AppCompatActivity() {
                 newPosition: Player.PositionInfo,
                 reason: Int
             ) {
-                currentSubtitleTimeMs = newPosition.contentPositionMs
+                currentSubtitleTimeMs = newPosition.contentPositionMs.roundToNearestInterval(SUBTITLE_SEGMENT_DURATION_MS)
             }
         })
 
         player.prepare()
         player.play()
+    }
+
+    private fun createAndStartTimelineScrollJob() {
+        timelineScrollJob = lifecycleScope.launch {
+            while(isActive) {
+                val per = player.currentPosition.toDouble() / player.duration
+                val scrollOffsetX = -(timelineTotalWidth * per).toInt()
+                (binding.recyclerViewTimeline.layoutManager as LinearLayoutManager).scrollToPositionWithOffset(
+                    0,
+                    scrollOffsetX
+                )
+                delay(50)
+            }
+        }
+    }
+
+    private fun createAndStartSubtitleJob() {
+        subtitleJob = CoroutineScope(Dispatchers.IO).launch {
+            while(isActive) {
+                delay((currentSubtitleTimeMs - withContext(Dispatchers.Main) { player.currentPosition })
+                    .coerceAtLeast(0))
+                val subtitleFile = getSubtitleFile(currentSubtitleTimeMs.roundToNearestInterval(SUBTITLE_SEGMENT_DURATION_MS))
+                val transcript = try {
+                    subtitleFile.readText()
+                } catch (e: Exception) {
+                    log("End of subtitle")
+                    currentSubtitleTimeMs += SUBTITLE_SEGMENT_DURATION_MS
+                    currentSubtitleTimeMs = currentSubtitleTimeMs.roundToNearestInterval(SUBTITLE_SEGMENT_DURATION_MS)
+                    continue
+                }
+
+                withContext(Dispatchers.Main) {
+                    showSubtitleOnUI(currentSubtitleTimeMs.toInt(), transcript)
+                }
+                currentSubtitleTimeMs += SUBTITLE_SEGMENT_DURATION_MS
+                currentSubtitleTimeMs = currentSubtitleTimeMs.roundToNearestInterval(SUBTITLE_SEGMENT_DURATION_MS)
+            }
+        }
+    }
+
+    private fun getSubtitleFile(timeMs: Long): File {
+        log("dddddddd $timeMs")
+        val outputDir = File(getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), "${videoUrl.hashCode()}")
+        if (!outputDir.exists()) {
+            outputDir.mkdirs()
+        }
+        return File(outputDir, "${timeMs}.txt")
+    }
+
+    private suspend fun loadAllSubtitles() {
+        player.pause()
+        for(time in 0..player.duration step SUBTITLE_SEGMENT_DURATION_MS) {
+            subtitleLoadJobs.add(CoroutineScope(Dispatchers.IO).launch {
+                val wavPath = externalCacheDir?.absolutePath + "/subtitle${time}.wav"
+                extractAudioSegment(
+                    this@VideoActivity,
+                    intent.data!!,
+                    wavPath,
+                    time,
+                    SUBTITLE_SEGMENT_DURATION_MS
+                )
+                val audioBytes = ByteString.copyFrom(Files.readAllBytes(File(wavPath).toPath()))
+                val audio = RecognitionAudio.newBuilder()
+                    .setContent(audioBytes)
+                    .build()
+                val response = speechClient.recognize(recognitionConfig, audio)
+
+                for (result in response.resultsList) {
+                    log("Load transcript $time   " + result.alternativesList[0].transcript)
+                    saveSubtitle(time, result.alternativesList[0].transcript)
+                }
+            })
+        }
+        subtitleLoadJobs.joinAll()
+        player.play()
+    }
+
+    private fun saveSubtitle(time: Long, subtitle: String) {
+        val subtitleFile = getSubtitleFile(time)
+        subtitleFile.writeText(subtitle)
+    }
+
+    @MainThread
+    private fun showSubtitleOnUI(time: Int, transcript: String) {
+        transcript.chunked(30).forEach { displayedSubtitleQueue.add(time to it) }
+        while (displayedSubtitleQueue.size >= 3)
+            displayedSubtitleQueue.removeAt(0)
+
+        val cue = Cue.Builder()
+            .setText(displayedSubtitleQueue.map { it.second }.joinToString("\n"))
+            .setLineAnchor(Cue.ANCHOR_TYPE_START)
+            .setLine(.8f, Cue.LINE_TYPE_FRACTION)
+            .build()
+
+        binding.playerView.subtitleView?.setCues(listOf(cue))
+        log(transcript)
     }
 
     private fun createSpeechSettings(): SpeechSettings =
@@ -203,60 +356,9 @@ class VideoActivity : AppCompatActivity() {
                 )
             ).build()
 
-    private val speechClient by lazy(LazyThreadSafetyMode.NONE) {
-        SpeechClient.create(speechSettings)
-    }
-    private val recognitionConfig by lazy(LazyThreadSafetyMode.NONE) {
-        RecognitionConfig.newBuilder()
-            .setEncoding(RecognitionConfig.AudioEncoding.LINEAR16)
-            .setLanguageCode(SUBTITLE_LANGUAGE_CODE)
-            .setAudioChannelCount(2)
-            .build()
-    }
-
-    private fun showNextSubtitle() {
-        subtitleJob = CoroutineScope(Dispatchers.IO).launch {
-            while (isActive) {
-                val wavPath = externalCacheDir?.absolutePath + "/subtitle.wav"
-                delay(maxOf(0, (currentSubtitleTimeMs - withContext(Dispatchers.Main) { player.currentPosition })))
-                extractAudioSegment(
-                    this@VideoActivity,
-                    intent.data!!,
-                    wavPath,
-                    currentSubtitleTimeMs,
-                    SUBTITLE_SEGMENT_DURATION_MS
-                )
-
-                val audioBytes = ByteString.copyFrom(Files.readAllBytes(File(wavPath).toPath()))
-                val audio = RecognitionAudio.newBuilder()
-                    .setContent(audioBytes)
-                    .build()
-                val response = speechClient.recognize(recognitionConfig, audio)
-
-                withContext(Dispatchers.Main) {
-                    showSubtitleOnUI(response)
-                }
-                currentSubtitleTimeMs += SUBTITLE_SEGMENT_DURATION_MS
-            }
-        }
-    }
-
-    private fun showSubtitleOnUI(response: RecognizeResponse) {
-        for (result in response.resultsList) {
-            val transcript = result.alternativesList[0].transcript
-            subtitleQueue.addAll(transcript.chunked(30))
-            while (subtitleQueue.size >= 3)
-                subtitleQueue.removeAt(0)
-
-            val cue = Cue.Builder()
-                .setText(subtitleQueue.joinToString("\n"))
-                .setLineAnchor(Cue.ANCHOR_TYPE_START)
-                .setLine(.8f, Cue.LINE_TYPE_FRACTION)
-                .build()
-
-            binding.playerView.subtitleView?.setCues(listOf(cue))
-            Log.d("STT ${currentSubtitleTimeMs / 1000}", transcript)
-        }
+    override fun onStart() {
+        super.onStart()
+        player.play()
     }
 
     override fun onStop() {
@@ -270,9 +372,13 @@ class VideoActivity : AppCompatActivity() {
         retriever.release()
     }
 
+    private fun log(message: String) {
+        Log.d(TAG, message)
+    }
+
     companion object {
         private const val SUBTITLE_LANGUAGE_CODE = "ko-KR"
-        private const val SUBTITLE_SEGMENT_DURATION_MS = 3500L
-        private val FPS = 1
+        private const val SUBTITLE_SEGMENT_DURATION_MS = 4000L
+        private const val TAG = "VideoActivity"
     }
 }

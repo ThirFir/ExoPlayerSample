@@ -31,7 +31,7 @@ fun extractAudioSegment(context: Context, mp4Uri: Uri, outputWavPath: String, st
 
     val bufferInfo = MediaCodec.BufferInfo()
     val wavOutputStream = FileOutputStream(outputWavPath)
-    writeWavHeader(wavOutputStream, format)  // WAV 헤더 추가
+    writeWavHeader(wavOutputStream, format)
 
     while (true) {
         if (extractor.sampleTime > endTime * 1000)
@@ -63,7 +63,7 @@ fun extractAudioSegment(context: Context, mp4Uri: Uri, outputWavPath: String, st
     wavOutputStream.close()
 }
 
-fun writeWavHeader(outputStream: FileOutputStream, format: MediaFormat) {
+private fun writeWavHeader(outputStream: FileOutputStream, format: MediaFormat) {
     val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
     val channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
     val byteRate = sampleRate * channels * 2  // 16-bit PCM
@@ -101,7 +101,7 @@ fun writeWavHeader(outputStream: FileOutputStream, format: MediaFormat) {
     outputStream.write(header)
 }
 
-fun Int.toLittleEndian(): ByteArray {
+private fun Int.toLittleEndian(): ByteArray {
     return byteArrayOf(
         (this and 0xFF).toByte(),
         (this shr 8 and 0xFF).toByte(),
