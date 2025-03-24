@@ -55,6 +55,7 @@ dependencies {
     implementation(libs.google.auth.library.oauth2.http)
     implementation(libs.grpc.okhttp)
     implementation(libs.grpc.stub)
+    implementation(libs.arthenica.ffmpeg.kit.full)
 
     implementation(libs.glide)
     implementation(libs.androidx.core.ktx)
